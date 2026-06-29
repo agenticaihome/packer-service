@@ -7,9 +7,13 @@ filesystem, serialises a content-addressed `celaut.Service`, and returns the
 packed service as a single **`.celaut.bee`** file.
 
 It is a thin wrapper around the *real* nodo packer
-([`src/packers/zip_with_dockerfile.py`](https://github.com/celaut-project/nodo/tree/stable/src/packers)),
-vendored into the image — not a re-implementation — so the `service_id` it emits
-is byte-identical to `nodo pack`.
+(`src/packers/zip_with_dockerfile.py`), **vendored in-repo** under
+[`vendor/nodo/`](vendor/nodo/) — not a re-implementation — so the `service_id`
+it emits is byte-identical to `nodo pack`. The vendored tree is the exact
+transitive import closure of the packer worker (packer + `src.utils` /
+`src.manager.resources` + the `protos/` package); the image no longer clones
+nodo at build time, so this service is self-contained and unaffected when nodo
+drops its local Docker packer.
 
 Since **v0.2.0** the same microVM also serves a **browser VS Code** on `:8443`
 (see [Browser IDE](#browser-ide-code-server)) so users can pick a language
@@ -159,12 +163,14 @@ Docker-in-Docker container:
   `service_id` (`8783b238…2d0e65be`) and identical `.bee` size each run —
   emulation does not introduce non-determinism.
 
-Determinism depends on two upstream-nodo fixes that are vendored into the
-packer's nodo clone (otherwise packing is non-reproducible):
+Determinism depends on two upstream-nodo fixes that are **baked into the
+vendored source** under `vendor/nodo/` (search for `DETERMINISM PATCH`);
+without them packing is non-reproducible. The Dockerfile asserts both are
+present so a regression fails the build:
 
-1. **sorted directory walk** — `recursive_parsing` must iterate `os.listdir()`
+1. **sorted directory walk** — `recursive_parsing` iterates `os.listdir()`
    sorted, so branch order is stable across extractions.
-2. **zeroed symlink mtime** — `filesystem_xattrs.metadata_from_lstat` must hash
+2. **zeroed symlink mtime** — `filesystem_xattrs.metadata_from_lstat` hashes
    `mtime_ns = 0`; `tarfile` otherwise reassigns symlink mtimes to wall-clock on
    every extract.
 

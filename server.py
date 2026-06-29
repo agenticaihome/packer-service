@@ -8,9 +8,10 @@ containing a Dockerfile, a packer config and a service.json, it builds the
 image, exports its filesystem, serialises a content-addressed `celaut.Service`
 protobuf, and returns the packed service as a single `.celaut.bee` file.
 
-It does NOT re-implement the packer. It vendors the real nodo packer (cloned
-into /opt/nodo at image-build time) and invokes its worker entrypoint, so the
-service-id produced here is byte-identical to `nodo pack`. Docker/buildx runs
+It does NOT re-implement the packer. It vendors the real nodo packer in-repo
+(vendor/nodo/, COPYed to /opt/nodo at image-build time — no clone of nodo) and
+invokes its worker entrypoint, so the service-id produced here is byte-identical
+to `nodo pack`. Docker/buildx runs
 inside this microVM (docker-in-docker); that is why the service declares
 `network: tag=(*)` — buildx must reach arbitrary registries to pull base images.
 

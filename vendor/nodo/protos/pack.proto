@@ -1,0 +1,42 @@
+syntax = "proto3";
+package pack;
+import "celaut.proto";
+
+message Service {
+    message Container {
+        message Init {
+            repeated string entry_path = 1;
+            map<string, bytes> xattrs = 2;
+        }
+
+        message Filesystem {
+            message ItemBranch {
+                string name = 1; // id for path
+                oneof item {
+                    bytes file = 2;
+                    string link = 3;
+                    celaut.Service.Container.Filesystem filesystem = 4;
+                }
+            }
+            repeated ItemBranch branch = 1;
+        }
+        celaut.Service.Container.Architecture architecture = 1;
+        celaut.Service.Container.Filesystem filesystem = 2;
+        Init init = 3;
+        optional celaut.Service.Container.Resources resources = 4;
+        celaut.Service.Container.ConfigDeclaration config_declaration = 5;
+        repeated celaut.Service.Api.Protocol node_protocol_stack = 6;
+    }
+    string prose = 1;
+    Container container = 2;
+    celaut.Service.Api api = 3;
+    repeated celaut.Service.Network network = 4;
+}
+
+message PackOutputServiceId {
+    bytes id = 1;
+}
+
+message PackOutputError {
+    string message = 1;
+}

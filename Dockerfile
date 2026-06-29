@@ -25,7 +25,6 @@ FROM docker:27-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de67
 # ---- runtime: debian (glibc) -------------------------------------------------
 FROM debian:bookworm-slim
 
-ARG NODO_REF=stable
 ENV NODO_DIR=/opt/nodo \
     PYTHONUNBUFFERED=1 \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
@@ -44,35 +43,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iptables iproute2 kmod e2fsprogs xfsprogs pigz xz-utils openssl uidmap \
     && rm -rf /var/lib/apt/lists/*
 
-# Vendor the nodo tree (packer + its src.utils / protos / bee_rpc deps).
-RUN git clone --depth 1 --branch "${NODO_REF}" \
-        https://github.com/celaut-project/nodo.git "${NODO_DIR}"
+# Vendor the nodo packer IN-REPO (self-contained — no clone of nodo at build
+# time). vendor/nodo/ carries the exact transitive import closure of the packer
+# worker `src.packers.zip_with_dockerfile`: the packer itself plus its
+# src.utils / src.manager.resources deps and the whole protos/ package. This
+# tree is independent of upstream nodo, so nodo can drop its Docker packer
+# without breaking this service. See vendor/nodo/README.md.
+COPY ./vendor/nodo/ /opt/nodo/
 
 # nodo resolves its docker tooling under NODO_ROOT (=/opt/nodo): bin/docker,
 # bin/dockerd, libexec/docker/cli-plugins/docker-buildx, and the socket at
 # docker/docker.sock — and RAISES if they're missing. Place the static engine
-# binaries exactly there (after the clone, so the target dir merges cleanly).
+# binaries exactly there (after the vendor COPY, so the dir merges cleanly).
 COPY --from=dind /usr/local/bin/ /opt/nodo/bin/
 COPY --from=dind /usr/local/libexec/ /opt/nodo/libexec/
 
-# Determinism patches (REQUIRED so this service's ids match `nodo pack` on a
-# patched node, and so packing the same project twice yields the same id).
-# Upstream nodo's packer is nondeterministic two ways:
-#   1. recursive_parsing iterates os.listdir() UNSORTED -> filesystem branch
-#      order (hence serialized bytes) varies between extractions of the same tar.
-#   2. it hashes mtime_ns, but tar extraction reassigns SYMLINK mtimes to the
-#      current wall-clock time -> the id changes every pack.
-# Both are content-irrelevant; normalise them. (Report upstream.)
-RUN sed -i \
-        's/for b_name in os.listdir(host_dir + directory):/for b_name in sorted(os.listdir(host_dir + directory)):/' \
-        "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
-    && sed -i \
-        's/mtime_ns=int(stat_result.st_mtime_ns),/mtime_ns=0,/' \
-        "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
-    && grep -q 'sorted(os.listdir(host_dir + directory))' \
+# Determinism patches are now BAKED into the vendored source (search for
+# "DETERMINISM PATCH" in vendor/nodo/). They make this service's ids match
+# `nodo pack` on a patched node, and make repeated packs reproducible:
+#   1. recursive_parsing sorts os.listdir() so filesystem branch order (hence
+#      serialized bytes) is stable across extractions of the same tar.
+#   2. mtime_ns is normalised to 0 (tar reassigns symlink mtimes to wall-clock
+#      time, which would otherwise change the id every pack).
+# Assert they are present so a regression in the vendored tree fails the build.
+RUN grep -q 'sorted(os.listdir(host_dir + directory))' \
         "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
     && grep -q 'mtime_ns=0,' "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
-    && echo "determinism patches applied"
+    && echo "determinism patches present in vendored source"
 
 # Install exactly the deps the packer worker (src/packers/zip_with_dockerfile)
 # imports — NOT nodo's full requirements (those drag in the Ergo payment stack:
