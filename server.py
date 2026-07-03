@@ -16,6 +16,27 @@ inside this microVM (docker-in-docker); that is why the service declares
 
 API (bound on 0.0.0.0:8080):
   GET  /health            -> 200 "ok"
+  GET  /registry/<id>     -> 200 JSON {present, metadata, blocks} if the packed
+                             dependency <id> is already in this packer's
+                             filesystem registry, else 404 {present:false}. Lets
+                             a client (nodo) skip re-uploading a dependency the
+                             packer already holds.
+  POST /registry/<id>     -> body = a gzip tar bundle of an already-packed
+                             service (a "registry dependency"). Injected into the
+                             packer host's REGISTRY / METADATA_REGISTRY / BLOCKDIR
+                             dirs so a subsequent /pack whose pack_config declares
+                             <id> as a registry dependency can resolve it (the
+                             vendored ggconf reads {REGISTRY}/<id>). Idempotent.
+                             Bundle layout (see _store_registry_bundle):
+                               service/         -> the multiblock service dir
+                                                   (becomes {REGISTRY}/<id>/)
+                               metadata         -> optional Metadata protobuf
+                                                   (becomes {METADATA_REGISTRY}/<id>)
+                               blocks/<blockid> -> optional shared block files
+                                                   (become {BLOCKDIR}/<blockid>)
+                             200 -> JSON {service_id, stored, already_present,
+                                    blocks_added}
+                             400 -> malformed/missing id or bad bundle
   POST /pack              -> body = project .zip (application/zip | octet-stream)
                              200 -> application/octet-stream, the `.celaut.bee`
                                     headers: X-Service-Id: <hex>
@@ -38,8 +59,11 @@ The zip must contain (at its root, or in a single top-level folder):
 import base64
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import uuid
 import zipfile
@@ -63,6 +87,160 @@ GUIDE = "SERVICE_CONFIG_GUIDE.md"
 # server is runnable/inspectable on its own.
 os.environ.setdefault("CACHE", "/var/lib/celaut/cache/")
 os.environ.setdefault("BLOCKDIR", "/var/lib/celaut/blocks/")
+
+# A packed service's on-disk id: content hash (hex) or a tag. Keep it filesystem
+# safe — no separators / traversal — since it names a directory under REGISTRY.
+_SERVICE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,255}$")
+
+# Cache of the packer's registry dirs so we only parse config.yaml once.
+_REGISTRY_DIRS = None
+
+
+def _load_packer_config() -> dict:
+    """Read the same config.yaml the vendored packer/ggconf reads (NODO_DIR/
+    config.yaml, i.e. the COPYed packer-config.yaml). Returns {} if it can't be
+    read (e.g. on a dev box without the image layout / without PyYAML), so the
+    caller can fall back to defaults."""
+    path = os.path.join(NODO_DIR, "config.yaml")
+    try:
+        import yaml  # PyYAML is present in the image (ConfigManager needs it).
+        with open(path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+
+
+def _registry_dirs():
+    """Resolve (REGISTRY, METADATA_REGISTRY, BLOCKDIR) — the dirs the vendored
+    ggconf resolves a registry dependency against. These MUST match what the
+    packer worker uses (config.yaml -> main.*), otherwise an injected dependency
+    lands where the packer can't see it.
+
+    Order: explicit PACKER_*_DIR env overrides (used by tests to point at temp
+    dirs) -> config.yaml main.* -> the image's built-in defaults.
+    """
+    global _REGISTRY_DIRS
+    if _REGISTRY_DIRS is not None:
+        return _REGISTRY_DIRS
+    cfg = _load_packer_config()
+    main = cfg.get("main", {}) if isinstance(cfg, dict) else {}
+    registry = (os.environ.get("PACKER_REGISTRY_DIR")
+                or main.get("REGISTRY") or "/opt/nodo/storage/__registry__/")
+    metadata = (os.environ.get("PACKER_METADATA_DIR")
+                or main.get("METADATA_REGISTRY")
+                or "/opt/nodo/storage/__metadata__/")
+    blocks = (os.environ.get("PACKER_BLOCKS_DIR")
+              or main.get("BLOCKDIR") or "/opt/nodo/storage/__block__/")
+    _REGISTRY_DIRS = (registry, metadata, blocks)
+    return _REGISTRY_DIRS
+
+
+def _registry_status(service_id: str):
+    """Return a dict describing whether <service_id> is present in the packer's
+    registry (and, if so, whether metadata + which blocks are there), or None if
+    the service dir isn't present at all."""
+    registry, metadata, _blocks = _registry_dirs()
+    service_dir = os.path.join(registry, service_id)
+    if not os.path.isdir(service_dir):
+        return None
+    blocks = []
+    manifest = os.path.join(service_dir, "_.json")
+    if os.path.exists(manifest):
+        try:
+            with open(manifest) as f:
+                for entry in json.load(f):
+                    if isinstance(entry, list) and entry:
+                        blocks.append(entry[0])
+        except Exception:
+            pass
+    return {
+        "present": True,
+        "metadata": os.path.exists(os.path.join(metadata, service_id)),
+        "blocks": blocks,
+    }
+
+
+def _safe_extract_tar(tf: tarfile.TarFile, dest: str):
+    """Extract a tar guarding against path traversal (absolute paths, .., and
+    symlinks/links escaping dest). Mirrors the zip handling used for /pack."""
+    dest_abs = os.path.abspath(dest)
+    for member in tf.getmembers():
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"unsafe link member in bundle: {member.name!r}")
+        target = os.path.abspath(os.path.join(dest, member.name))
+        if target != dest_abs and not target.startswith(dest_abs + os.sep):
+            raise RuntimeError(f"unsafe path in bundle: {member.name!r}")
+    tf.extractall(dest)
+
+
+def _store_registry_bundle(service_id: str, bundle_path: str) -> dict:
+    """Inject an already-packed dependency into the packer host's registry so a
+    later /pack can resolve `service_id` as a registry dependency.
+
+    `bundle_path` is a gzip tar with this layout (all paths relative to root):
+        service/          -> the packed service's multiblock dir; its contents
+                             become {REGISTRY}/{service_id}/ (must contain _.json)
+        metadata          -> optional; the Metadata protobuf, copied verbatim to
+                             {METADATA_REGISTRY}/{service_id}
+        blocks/<blockid>  -> optional; content-addressed shared block files, each
+                             copied to {BLOCKDIR}/<blockid> if not already present
+
+    Content-addressed and therefore idempotent: if the service dir already
+    exists we treat it as already-present and only backfill any missing blocks.
+    Returns {service_id, stored, already_present, blocks_added}.
+    """
+    registry, metadata, blockdir = _registry_dirs()
+    for d in (registry, metadata, blockdir):
+        os.makedirs(d, exist_ok=True)
+
+    extract = tempfile.mkdtemp(prefix="reg-", dir=os.environ["CACHE"])
+    try:
+        with tarfile.open(bundle_path, "r:*") as tf:
+            _safe_extract_tar(tf, extract)
+
+        src_service = os.path.join(extract, "service")
+        if not os.path.isdir(src_service):
+            raise RuntimeError(
+                "bundle is missing a top-level 'service/' directory (the packed "
+                "service's multiblock dir).")
+        if not os.path.exists(os.path.join(src_service, "_.json")):
+            raise RuntimeError(
+                "bundle 'service/' has no _.json manifest — not a packed service "
+                "directory.")
+
+        service_dir = os.path.join(registry, service_id)
+        already_present = os.path.isdir(service_dir)
+        if not already_present:
+            # Atomic-ish publish: move the fully-extracted dir into place.
+            os.replace(src_service, service_dir)
+
+        # Metadata (a single file) — write if provided and not already there.
+        src_meta = os.path.join(extract, "metadata")
+        if os.path.isfile(src_meta):
+            dst_meta = os.path.join(metadata, service_id)
+            if not os.path.exists(dst_meta):
+                shutil.move(src_meta, dst_meta)
+
+        # Blocks are shared + content-addressed: only add the ones we don't have.
+        blocks_added = 0
+        src_blocks = os.path.join(extract, "blocks")
+        if os.path.isdir(src_blocks):
+            for name in os.listdir(src_blocks):
+                if not _SERVICE_ID_RE.match(name):
+                    continue  # ignore anything with a suspicious name
+                dst_block = os.path.join(blockdir, name)
+                if not os.path.exists(dst_block):
+                    shutil.move(os.path.join(src_blocks, name), dst_block)
+                    blocks_added += 1
+
+        return {
+            "service_id": service_id,
+            "stored": True,
+            "already_present": already_present,
+            "blocks_added": blocks_added,
+        }
+    finally:
+        shutil.rmtree(extract, ignore_errors=True)
 
 
 def _has_config(project: str, name: str) -> bool:
@@ -280,12 +458,42 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quieter, single-line logs to stderr
         sys.stderr.write("[packer] " + (fmt % args) + "\n")
 
+    def _registry_id_from_path(self):
+        """Parse a validated <id> out of /registry/<id>, or None (and send the
+        appropriate error) if the path/id is malformed."""
+        rest = self.path.split("?", 1)[0].rstrip("/")
+        prefix = "/registry/"
+        if not rest.startswith(prefix):
+            self._send(404, "not found")
+            return None
+        service_id = rest[len(prefix):]
+        if not service_id or "/" in service_id or not _SERVICE_ID_RE.match(service_id):
+            self._send(400, "invalid service id in /registry/<id>")
+            return None
+        return service_id
+
     def do_GET(self):
         if self.path.rstrip("/") in ("/health", "/healthz", ""):
             return self._send(200, "ok")
+        if self.path.split("?", 1)[0].rstrip("/").startswith("/registry/"):
+            service_id = self._registry_id_from_path()
+            if service_id is None:
+                return
+            status = _registry_status(service_id)
+            if status is None:
+                return self._send(
+                    404,
+                    json.dumps({"service_id": service_id, "present": False}),
+                    ctype="application/json")
+            return self._send(
+                200,
+                json.dumps({"service_id": service_id, **status}),
+                ctype="application/json")
         return self._send(404, "not found")
 
     def do_POST(self):
+        if self.path.split("?", 1)[0].rstrip("/").startswith("/registry/"):
+            return self._handle_registry_upload()
         if self.path.rstrip("/") != "/pack":
             return self._send(404, "not found")
         length = int(self.headers.get("Content-Length", 0))
@@ -369,6 +577,42 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, f"internal error: {e}")
         finally:
             subprocess.run(["rm", "-rf", work], check=False)
+
+    def _handle_registry_upload(self):
+        """POST /registry/<id> — inject a packed dependency into the registry."""
+        service_id = self._registry_id_from_path()
+        if service_id is None:
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        if length <= 0:
+            return self._send(415, "empty body; POST a gzip tar dependency bundle")
+        if length > MAX_ZIP_BYTES:
+            return self._send(413, f"bundle too large (> {MAX_ZIP_BYTES} bytes)")
+
+        os.makedirs(os.environ["CACHE"], exist_ok=True)
+        work = tempfile.mkdtemp(prefix="reg-up-", dir=os.environ["CACHE"])
+        bundle_path = os.path.join(work, "bundle.tar.gz")
+        try:
+            remaining = length
+            with open(bundle_path, "wb") as f:
+                while remaining > 0:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    remaining -= len(chunk)
+
+            if not tarfile.is_tarfile(bundle_path):
+                return self._send(415, "body is not a valid tar archive")
+
+            result = _store_registry_bundle(service_id, bundle_path)
+            return self._send(200, json.dumps(result), ctype="application/json")
+        except RuntimeError as e:
+            return self._send(400, f"invalid dependency bundle: {e}")
+        except Exception as e:  # noqa: BLE001
+            return self._send(500, f"internal error: {e}")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
