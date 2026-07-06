@@ -55,24 +55,25 @@ RUN git clone --depth 1 --branch "${NODO_REF}" \
 COPY --from=dind /usr/local/bin/ /opt/nodo/bin/
 COPY --from=dind /usr/local/libexec/ /opt/nodo/libexec/
 
-# Determinism patches (REQUIRED so this service's ids match `nodo pack` on a
-# patched node, and so packing the same project twice yields the same id).
-# Upstream nodo's packer is nondeterministic two ways:
-#   1. recursive_parsing iterates os.listdir() UNSORTED -> filesystem branch
-#      order (hence serialized bytes) varies between extractions of the same tar.
-#   2. it hashes mtime_ns, but tar extraction reassigns SYMLINK mtimes to the
-#      current wall-clock time -> the id changes every pack.
-# Both are content-irrelevant; normalise them. (Report upstream.)
-RUN sed -i \
-        's/for b_name in os.listdir(host_dir + directory):/for b_name in sorted(os.listdir(host_dir + directory)):/' \
+# Determinism guards (REQUIRED so this service's ids match `nodo pack` on a
+# stable node, and so packing the same project twice yields the same id).
+# Upstream nodo's packer WAS nondeterministic two ways, and `stable` has since
+# fixed BOTH — so we no longer patch, we VERIFY. This service must serialize with
+# upstream's exact logic; re-forcing our old values (e.g. mtime_ns=0 for regular
+# files) would now DIVERGE from a stable node's `nodo pack` and change the id.
+#   1. recursive_parsing now iterates sorted(os.listdir()) -> stable branch order
+#      (was UNSORTED -> serialized bytes varied between extractions of one tar).
+#   2. get_filesystem_metadata now zeroes ONLY symlink mtimes -- tar extraction
+#      re-stamps symlink mtimes to wall-clock each pass, while regular-file mtimes
+#      are restored from the tar and stay deterministic (was: hashed raw mtime_ns
+#      for everything -> id changed every pack).
+# The greps below fail the build LOUDLY if a future upstream drift removes either
+# property, rather than silently packing a service whose id won't match the node.
+RUN grep -q 'sorted(os.listdir(host_dir + directory))' \
         "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
-    && sed -i \
-        's/mtime_ns=int(stat_result.st_mtime_ns),/mtime_ns=0,/' \
+    && grep -q 'mtime_ns=(0 if stat.S_ISLNK(mode) else int(stat_result.st_mtime_ns))' \
         "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
-    && grep -q 'sorted(os.listdir(host_dir + directory))' \
-        "${NODO_DIR}/src/packers/zip_with_dockerfile.py" \
-    && grep -q 'mtime_ns=0,' "${NODO_DIR}/src/utils/filesystem_xattrs.py" \
-    && echo "determinism patches applied"
+    && echo "determinism guards verified (upstream stable already deterministic)"
 
 # Install exactly the deps the packer worker (src/packers/zip_with_dockerfile)
 # imports — NOT nodo's full requirements (those drag in the Ergo payment stack:
