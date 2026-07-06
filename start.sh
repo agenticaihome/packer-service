@@ -17,7 +17,10 @@ export NODO_DIR="${NODO_DIR:-/opt/nodo}"
 export MAIN_DIR="${NODO_DIR}"
 export PYTHONPATH="${NODO_DIR}:${PYTHONPATH}"
 # Static Docker engine binaries live under NODO_DIR/bin (see Dockerfile).
-export PATH="${NODO_DIR}/bin:${PATH}"
+# Pin the standard system dirs explicitly: this script is PID 1 in the CH guest,
+# and switch_root gives init a minimal env, so ${PATH} can be empty here — leaving
+# coreutils (mkdir/mount/…) unresolvable. Prepending nodo/bin + the usual dirs.
+export PATH="${NODO_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
 # nodo's runtime.py points DOCKER_CONFIG / buildx state here; create the builder
 # with the SAME config dir so the worker sees the nodo-hostnet builder.
 export DOCKER_CONFIG="${NODO_DIR}/libexec/docker"
@@ -34,6 +37,29 @@ export BUILDX_BUILDER="${BUILDX_BUILDER:-nodo-hostnet}"
 # Force pure-python protobuf so the xattrs map serializes in the same byte order
 # as the node packer (also pinned to pure-python) -> matching, stable service-id.
 export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION="python"
+
+# --- cgroups -----------------------------------------------------------------
+# The CH guest has NO init system: this script is PID 1 (nodo's initramfs does a
+# switch_root straight into it). nodo's initramfs mounts /proc /sys /dev /dev/shm
+# /run but NOT the cgroup hierarchy, and there is no systemd to mount it. Rootful
+# dockerd (v27) requires cgroups; with none mounted it probes /sys/fs/cgroup, sees
+# no cgroup2 magic, defaults to legacy cgroup-v1 mode, finds no controller mounts,
+# and aborts at startup with "Devices cgroup isn't mounted". dockerd exits, this
+# PID-1 script exits, and the kernel panics ("Attempted to kill init").
+#
+# Fix: mount the unified cgroup-v2 hierarchy before dockerd. On v2 device control
+# is eBPF-based (no separate /sys/fs/cgroup/devices mount), so the v1 devices check
+# is bypassed and dockerd starts in cgroup-v2 mode (guest kernel 5.15 supports it).
+# Guard on cgroup.controllers so this is a no-op if a future initramfs already
+# mounts it. Non-fatal on failure so the diagnostic reaches the serial log.
+if [ ! -e /sys/fs/cgroup/cgroup.controllers ]; then
+  echo "[start] mounting cgroup2 at /sys/fs/cgroup (no init system in guest) ..."
+  mkdir -p /sys/fs/cgroup
+  mount -t cgroup2 none /sys/fs/cgroup \
+    || echo "[start] WARN: cgroup2 mount failed; dockerd will likely fail." >&2
+else
+  echo "[start] cgroup2 already mounted at /sys/fs/cgroup."
+fi
 
 mkdir -p "$CACHE" "$BLOCKDIR" \
     "${NODO_DIR}/docker/data" "${NODO_DIR}/docker/exec" "${DOCKER_CONFIG}"
