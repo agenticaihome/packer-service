@@ -30,6 +30,19 @@ MIN_BUFFER_BLOCK_SIZE = 10 * 1024 * 1024  # 10MB
 BUILDX_NETWORK = "host"
 BUILDX_BUILDER = "nodo-hostnet"
 
+# --- Init standard -----------------------------------------------------------
+# Fallback resources applied to a packed service when its service.json does NOT
+# declare them under resources.at_init / resources.at_most. A developer can
+# still override any field explicitly; these only fill the gaps.
+#
+# The old fallbacks (10 MB mem / 2 GB disk) were too small: a microVM sized at
+# 2 GB disk ENOSPCs ("[Errno 28] No space left on device") while nodo builds and
+# seals heavier images inside the sealed VM. The standard below matches the disk
+# the packer service itself runs with (see service.json) so a service packed
+# without explicit resources runs on a sane default instead of failing.
+DEFAULT_INIT_MEM_LIMIT   = 536_870_912     # 0.5 GB
+DEFAULT_INIT_DISK_SPACE  = 10_737_418_240  # 10 GB
+
 # Ensure bee_rpc uses the configured cache and block directories.
 os.makedirs(CACHE, exist_ok=True)
 os.makedirs(BLOCKDIR, exist_ok=True)
@@ -290,15 +303,15 @@ class ZipContainerPacker:
         init_blkio_weight = int(at_init.get("blkio_weight", 0))
         init_cpu_period   = int(at_init.get("cpu_period", 0))
         init_cpu_quota    = int(at_init.get("cpu_quota", 0))
-        init_mem_limit    = int(at_init.get("mem_limit", 10_000_000))       # 10MB by default
-        init_disk_space   = int(at_init.get("disk_space", 2_000_000_000))   # 2GB by default
+        init_mem_limit    = int(at_init.get("mem_limit", DEFAULT_INIT_MEM_LIMIT))    # 0.5GB standard fallback
+        init_disk_space   = int(at_init.get("disk_space", DEFAULT_INIT_DISK_SPACE))  # 10GB standard fallback
 
         # Ensure at_most values are at least as high as at_init
         most_blkio_weight = max(init_blkio_weight, int(at_most.get("blkio_weight", 0)))
         most_cpu_period   = max(init_cpu_period, int(at_most.get("cpu_period", 0)))
         most_cpu_quota    = max(init_cpu_quota, int(at_most.get("cpu_quota", 0)))
-        most_mem_limit    = max(init_mem_limit, int(at_most.get("mem_limit", 10_000_000)))       # 10MB by default
-        most_disk_space   = max(init_disk_space, int(at_most.get("disk_space", 2_000_000_000)))   # 2GB by default
+        most_mem_limit    = max(init_mem_limit, int(at_most.get("mem_limit", DEFAULT_INIT_MEM_LIMIT)))    # 0.5GB standard fallback
+        most_disk_space   = max(init_disk_space, int(at_most.get("disk_space", DEFAULT_INIT_DISK_SPACE)))  # 10GB standard fallback
 
         # Assign values to the container resources
         r = self.service.container.resources

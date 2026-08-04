@@ -65,9 +65,13 @@ class ServiceJsonReservationTests(unittest.TestCase):
         )
 
     def test_disk_was_cut_hard(self):
-        # Old floor was 20 GiB at both ranges; the new floor must be far smaller.
-        self.assertLessEqual(self.res["at_init"]["disk_space"], 4 * 1024 * 1024 * 1024)
-        self.assertLessEqual(self.res["at_most"]["disk_space"], 4 * 1024 * 1024 * 1024)
+        # Old floor was 20 GiB at both ranges. The current standard is 10 GiB
+        # (the packer builds/seals heavier images inside the sealed VM and
+        # ENOSPCs below this — see the init standard in
+        # src/packers/zip_with_dockerfile.py). Still well under the old floor.
+        TEN_GIB = 10 * 1024 * 1024 * 1024
+        self.assertLessEqual(self.res["at_init"]["disk_space"], TEN_GIB)
+        self.assertLessEqual(self.res["at_most"]["disk_space"], TEN_GIB)
 
 
 class _FakeManager:
